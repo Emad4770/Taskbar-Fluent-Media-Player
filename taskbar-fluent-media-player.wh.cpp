@@ -5958,15 +5958,18 @@ static std::wstring FormatMediaTime(int64_t ticks) {
 struct SeekBar {
     FrameworkElement root{nullptr};
     Grid             track{nullptr};
+    Grid             line{nullptr};
     Border           rail{nullptr};
     Border           fill{nullptr};
     winrt::Windows::UI::Xaml::Shapes::Ellipse thumb{nullptr};
     TextBlock        elapsed{nullptr};
     TextBlock        total{nullptr};
+    UIElement        shrinkTarget{nullptr};
     double           lineH      = 4.0;
     double           hoverLineH = 4.0;
     bool             hovered  = false;
     bool             dragging = false;
+    bool             expanded = false;
     double           dragFrac = 0.0;
 };
 [[clang::no_destroy]] static std::shared_ptr<SeekBar> g_popupSeekBar;
@@ -5992,6 +5995,34 @@ static void SeekToFraction(double frac) {
         winrt::uninit_apartment();
     });
 }
+static constexpr double kSeekExpandedContentScale = 0.88;
+// Grows the line, pops the thumb in and shrinks shrinkTarget; only To is set, so an interrupted hover reverses smoothly.
+static void AnimateSeekExpand(SeekBar& sb, bool expand) {
+    try {
+        Storyboard story;
+        auto animate = [&](DependencyObject const& target, const wchar_t* path, double to) {
+            DoubleAnimation a;
+            a.To(to);
+            a.Duration(DurationHelper::FromTimeSpan(std::chrono::milliseconds(160)));
+            CircleEase ease;
+            ease.EasingMode(EasingMode::EaseOut);
+            a.EasingFunction(ease);
+            Storyboard::SetTarget(a, target);
+            Storyboard::SetTargetProperty(a, path);
+            story.Children().Append(a);
+        };
+        animate(sb.line, L"(UIElement.RenderTransform).(ScaleTransform.ScaleY)",
+                expand ? 1.0 : sb.lineH / sb.hoverLineH);
+        animate(sb.thumb, L"(UIElement.RenderTransform).(CompositeTransform.ScaleX)", expand ? 1.0 : 0.0);
+        animate(sb.thumb, L"(UIElement.RenderTransform).(CompositeTransform.ScaleY)", expand ? 1.0 : 0.0);
+        if (sb.shrinkTarget) {
+            double s = expand ? kSeekExpandedContentScale : 1.0;
+            animate(sb.shrinkTarget, L"(UIElement.RenderTransform).(ScaleTransform.ScaleX)", s);
+            animate(sb.shrinkTarget, L"(UIElement.RenderTransform).(ScaleTransform.ScaleY)", s);
+        }
+        story.Begin();
+    } catch (...) {}
+}
 static void UpdateSeekBar(SeekBar& sb) {
     if (!sb.root) return;
     int64_t start = 0, end = 0, pos = 0;
@@ -6005,17 +6036,18 @@ static void UpdateSeekBar(SeekBar& sb) {
         canSeek = g_media.canSeek;
     }
     try {
+        bool active = show && canSeek && (sb.hovered || sb.dragging);
+        if (active != sb.expanded) {
+            sb.expanded = active;
+            AnimateSeekExpand(sb, active);
+        }
         sb.root.Visibility(show ? Visibility::Visible : Visibility::Collapsed);
         if (!show) return;
         double frac = sb.dragging ? sb.dragFrac : (double)(pos - start) / (double)(end - start);
         double w = sb.track.ActualWidth();
-        double lineH = (sb.hovered || sb.dragging) ? sb.hoverLineH : sb.lineH;
-        sb.rail.Height(lineH);
-        sb.fill.Height(lineH);
         sb.fill.Width(frac * w);
-        if (auto t = sb.thumb.RenderTransform().try_as<TranslateTransform>())
-            t.X(frac * w - sb.thumb.Width() / 2);
-        sb.thumb.Visibility(canSeek && (sb.hovered || sb.dragging) ? Visibility::Visible : Visibility::Collapsed);
+        if (auto t = sb.thumb.RenderTransform().try_as<CompositeTransform>())
+            t.TranslateX(frac * w - sb.thumb.Width() / 2);
         sb.track.IsHitTestVisible(canSeek);
         if (sb.elapsed) sb.elapsed.Text(winrt::hstring(FormatMediaTime((int64_t)(frac * (double)(end - start)))));
         if (sb.total)   sb.total.Text(winrt::hstring(FormatMediaTime(end - start)));
@@ -6040,28 +6072,36 @@ static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, dou
     Grid track;
     track.Height(hitH);
     track.Background(MakeBrush({0x00, 0x00, 0x00, 0x00}));
+    Grid line;
+    line.Height(hoverLineH);
+    line.VerticalAlignment(VerticalAlignment::Center);
+    line.RenderTransformOrigin({0.5f, 0.5f});
+    ScaleTransform lineScale;
+    lineScale.ScaleY(lineH / hoverLineH);
+    line.RenderTransform(lineScale);
     Border rail;
-    rail.Height(lineH);
     rail.CornerRadius({r, r, r, r});
-    rail.VerticalAlignment(VerticalAlignment::Center);
     Border fill;
-    fill.Height(lineH);
     fill.Width(0);
     fill.CornerRadius({r, r, r, r});
     fill.HorizontalAlignment(HorizontalAlignment::Left);
-    fill.VerticalAlignment(VerticalAlignment::Center);
+    line.Children().Append(rail);
+    line.Children().Append(fill);
     winrt::Windows::UI::Xaml::Shapes::Ellipse thumb;
     thumb.Width(thumbD);
     thumb.Height(thumbD);
     thumb.HorizontalAlignment(HorizontalAlignment::Left);
     thumb.VerticalAlignment(VerticalAlignment::Center);
-    thumb.RenderTransform(TranslateTransform());
+    thumb.RenderTransformOrigin({0.5f, 0.5f});
+    CompositeTransform thumbXf;
+    thumbXf.ScaleX(0.0);
+    thumbXf.ScaleY(0.0);
+    thumb.RenderTransform(thumbXf);
     thumb.IsHitTestVisible(false);
-    thumb.Visibility(Visibility::Collapsed);
-    track.Children().Append(rail);
-    track.Children().Append(fill);
+    track.Children().Append(line);
     track.Children().Append(thumb);
     sb->track      = track;
+    sb->line       = line;
     sb->rail       = rail;
     sb->fill       = fill;
     sb->thumb      = thumb;
@@ -6103,6 +6143,8 @@ static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, dou
         if (!s || !g || !s->dragging) return;
         s->dragFrac = fracAt(g, e);
         s->dragging = false;
+        auto p = e.GetCurrentPoint(g).Position();
+        s->hovered = p.X >= 0 && p.Y >= 0 && p.X <= g.ActualWidth() && p.Y <= g.ActualHeight();
         g.ReleasePointerCapture(e.Pointer());
         SeekToFraction(s->dragFrac);
         UpdateSeekBar(*s);
@@ -6110,6 +6152,9 @@ static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, dou
     });
     track.PointerCaptureLost([weak](IInspectable const&, PointerRoutedEventArgs const&) {
         if (auto s = weak.lock(); s && s->dragging) { s->dragging = false; UpdateSeekBar(*s); }
+    });
+    track.PointerCanceled([weak](IInspectable const&, PointerRoutedEventArgs const&) {
+        if (auto s = weak.lock()) { s->dragging = false; s->hovered = false; UpdateSeekBar(*s); }
     });
     track.SizeChanged([weak](IInspectable const&, SizeChangedEventArgs const&) {
         if (auto s = weak.lock()) UpdateSeekBar(*s);
@@ -6152,14 +6197,19 @@ static FrameworkElement BuildPopupSeekRow() {
     g_popupSeekBar = sb;
     return row;
 }
-static FrameworkElement BuildTaskbarSeekBar() {
+static FrameworkElement BuildTaskbarSeekBar(UIElement const& shrinkTarget) {
     auto sb = std::make_shared<SeekBar>();
     Grid host;
     host.HorizontalAlignment(HorizontalAlignment::Stretch);
     host.VerticalAlignment(VerticalAlignment::Stretch);
     if (g_settings.playerMinHeight > 0) host.MinHeight((double)g_settings.playerMinHeight);
     if (g_settings.playerMaxHeight > 0) host.MaxHeight((double)g_settings.playerMaxHeight);
-    Grid track = BuildSeekTrack(sb, 2.0, 4.0, 8.0, 8.0);
+    if (shrinkTarget) {
+        shrinkTarget.RenderTransformOrigin({0.5f, 0.0f});
+        shrinkTarget.RenderTransform(ScaleTransform());
+        sb->shrinkTarget = shrinkTarget;
+    }
+    Grid track = BuildSeekTrack(sb, 2.0, 6.0, 10.0, 10.0);
     track.VerticalAlignment(VerticalAlignment::Bottom);
     double inset = std::max({4.0, g_settings.cornerRadiusBL, g_settings.cornerRadiusBR});
     track.Margin({inset, 0, inset, 0});
@@ -8606,7 +8656,7 @@ static Grid BuildPlayerGrid() {
         wrapper.Children().Append(playerButton);
         wrapper.Children().Append(panel);
         if (g_settings.showSeekBarOnTaskbar) {
-            auto seekHost = BuildTaskbarSeekBar();
+            auto seekHost = BuildTaskbarSeekBar(panel);
             Canvas::SetZIndex(seekHost, 3);
             wrapper.Children().Append(seekHost);
         }
