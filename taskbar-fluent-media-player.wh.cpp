@@ -375,6 +375,11 @@ If you encounter any issues or have a feature suggestion, please open a report o
       $name:ru-RU: Показывать полосу перемотки в меню плеера
       $description: Elapsed time, a draggable progress bar and total time in the mini player popup. Hidden for apps that don't report the track length.
       $description:ru-RU: Прошедшее время, перетаскиваемая полоса прогресса и общая длительность в мини-плеере. Скрывается для приложений, которые не сообщают длительность трека.
+    - showSeekBarOnTaskbar: false
+      $name: Show seek bar on taskbar player
+      $name:ru-RU: Показывать полосу перемотки на плеере в панели задач
+      $description: A thin progress line along the bottom of the player. It thickens on hover; click or drag it to seek.
+      $description:ru-RU: Тонкая линия прогресса вдоль нижнего края плеера. Утолщается при наведении; нажмите или перетащите для перемотки.
     - seekBarColor: "-1 -1 -1"
       $name: Seek bar color (RGB)
       $name:ru-RU: Цвет полосы перемотки (RGB)
@@ -1425,6 +1430,7 @@ struct ModSettings {
     int          vizPadLeft      = 0;
     int          vizPadRight     = 0;
     bool         showSeekBarInPopup = true;
+    bool         showSeekBarOnTaskbar = false;
     std::wstring seekBarColor    = L"-1 -1 -1";
 };
 static ModSettings g_settings;
@@ -1665,6 +1671,7 @@ static void LoadSettings() {
     g_settings.vizColor1       = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor1", L"30 215 96");
     g_settings.vizColor2       = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor2", L"0 180 255");
     g_settings.showSeekBarInPopup = Wh_GetIntSetting(L"MainSettings.SeekBarSettings.showSeekBarInPopup") != 0;
+    g_settings.showSeekBarOnTaskbar = Wh_GetIntSetting(L"MainSettings.SeekBarSettings.showSeekBarOnTaskbar") != 0;
     g_settings.seekBarColor    = Str(L"MainSettings.SeekBarSettings.seekBarColor", L"-1 -1 -1");
     g_settings.vizSensitivity  = Int(L"MainSettings.VisualizerFunctionsSettings.vizSensitivity", 0, 300, 150);
     {
@@ -1898,6 +1905,8 @@ static void LoadSettings() {
 static HWND FindCurrentProcessTaskbarWnd();
 static void DispatchMediaUpdate();
 static void RefreshMiniPlayerFlyoutUI();
+static void RefreshSeekBars();
+static void RecolorSeekBars();
 static void FetchMiniSessionInfosAsync(HWND taskbarWnd);
 struct MiniSessionInfo;
 static void AnimateSessionPill(winrt::Windows::UI::Xaml::Shapes::Rectangle const& pill, bool isCurrent, bool animate);
@@ -3915,6 +3924,9 @@ static void FetchTimelineAsync() {
                 g_media.timelineUpdated = updated;
             }
         } catch (...) {}
+        HWND tw = g_taskbarWnd;
+        if (tw && !g_unloading && !g_applyingSettings)
+            RunFromWindowThread(tw, [](void*) { RefreshSeekBars(); }, nullptr);
         winrt::uninit_apartment();
     });
 }
@@ -5218,6 +5230,7 @@ static void RefreshThemeColors() {
             if (auto tb = fe.try_as<TextBlock>()) tb.Foreground(MakeBrush(textClr));
         if (auto fe = FindChildByName(g_playerGrid, kArtistBlockName))
             if (auto ab = fe.try_as<TextBlock>()) ab.Foreground(MakeBrush(artistClr));
+        RecolorSeekBars();
         for (const wchar_t* name : {kPrevBtnName, kPlayBtnName, kNextBtnName, kRewindBtnName, kForwardBtnName, kShuffleBtnName, kRepeatBtnName, kSwitchSessionsBtnName}) {
             if (auto fe = FindChildByName(g_playerGrid, name)) {
                 if (auto btn = fe.try_as<Button>()) {
@@ -5945,15 +5958,19 @@ static std::wstring FormatMediaTime(int64_t ticks) {
 struct SeekBar {
     FrameworkElement root{nullptr};
     Grid             track{nullptr};
+    Border           rail{nullptr};
     Border           fill{nullptr};
     winrt::Windows::UI::Xaml::Shapes::Ellipse thumb{nullptr};
     TextBlock        elapsed{nullptr};
     TextBlock        total{nullptr};
+    double           lineH      = 4.0;
+    double           hoverLineH = 4.0;
     bool             hovered  = false;
     bool             dragging = false;
     double           dragFrac = 0.0;
 };
 [[clang::no_destroy]] static std::shared_ptr<SeekBar> g_popupSeekBar;
+[[clang::no_destroy]] static std::shared_ptr<SeekBar> g_taskbarSeekBar;
 [[clang::no_destroy]] static winrt::Windows::UI::Xaml::DispatcherTimer g_seekTimer{nullptr};
 static void SeekToFraction(double frac) {
     int64_t target = 0;
@@ -5992,6 +6009,9 @@ static void UpdateSeekBar(SeekBar& sb) {
         if (!show) return;
         double frac = sb.dragging ? sb.dragFrac : (double)(pos - start) / (double)(end - start);
         double w = sb.track.ActualWidth();
+        double lineH = (sb.hovered || sb.dragging) ? sb.hoverLineH : sb.lineH;
+        sb.rail.Height(lineH);
+        sb.fill.Height(lineH);
         sb.fill.Width(frac * w);
         if (auto t = sb.thumb.RenderTransform().try_as<TranslateTransform>())
             t.X(frac * w - sb.thumb.Width() / 2);
@@ -6001,41 +6021,53 @@ static void UpdateSeekBar(SeekBar& sb) {
         if (sb.total)   sb.total.Text(winrt::hstring(FormatMediaTime(end - start)));
     } catch (...) {}
 }
-static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, double thumbD) {
+static void ApplySeekBarColors(SeekBar& sb) {
+    if (!sb.rail) return;
+    try {
+        auto color = ParseColorWithThemeSupport(g_settings.seekBarColor, 255);
+        auto faded = color;
+        faded.A = 0x50;
+        sb.rail.Background(MakeBrush(faded));
+        sb.fill.Background(MakeBrush(color));
+        sb.thumb.Fill(MakeBrush(color));
+    } catch (...) {}
+}
+// hitH must be >= thumbD, or XAML clips the thumb to the track's height.
+static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, double hoverLineH,
+                           double thumbD, double hitH) {
     using winrt::Windows::Foundation::IInspectable;
-    auto color = ParseColorWithThemeSupport(g_settings.seekBarColor, 255);
-    auto faded = color;
-    faded.A = 0x50;
+    double r = hoverLineH / 2;
     Grid track;
-    track.Height(std::max(lineH, thumbD) + 4);
+    track.Height(hitH);
     track.Background(MakeBrush({0x00, 0x00, 0x00, 0x00}));
     Border rail;
     rail.Height(lineH);
-    rail.CornerRadius({lineH / 2, lineH / 2, lineH / 2, lineH / 2});
+    rail.CornerRadius({r, r, r, r});
     rail.VerticalAlignment(VerticalAlignment::Center);
-    rail.Background(MakeBrush(faded));
     Border fill;
     fill.Height(lineH);
     fill.Width(0);
-    fill.CornerRadius({lineH / 2, lineH / 2, lineH / 2, lineH / 2});
+    fill.CornerRadius({r, r, r, r});
     fill.HorizontalAlignment(HorizontalAlignment::Left);
     fill.VerticalAlignment(VerticalAlignment::Center);
-    fill.Background(MakeBrush(color));
     winrt::Windows::UI::Xaml::Shapes::Ellipse thumb;
     thumb.Width(thumbD);
     thumb.Height(thumbD);
     thumb.HorizontalAlignment(HorizontalAlignment::Left);
     thumb.VerticalAlignment(VerticalAlignment::Center);
-    thumb.Fill(MakeBrush(color));
     thumb.RenderTransform(TranslateTransform());
     thumb.IsHitTestVisible(false);
     thumb.Visibility(Visibility::Collapsed);
     track.Children().Append(rail);
     track.Children().Append(fill);
     track.Children().Append(thumb);
-    sb->track = track;
-    sb->fill  = fill;
-    sb->thumb = thumb;
+    sb->track      = track;
+    sb->rail       = rail;
+    sb->fill       = fill;
+    sb->thumb      = thumb;
+    sb->lineH      = lineH;
+    sb->hoverLineH = hoverLineH;
+    ApplySeekBarColors(*sb);
     std::weak_ptr<SeekBar> weak = sb;
     auto fracAt = [](Grid const& g, PointerRoutedEventArgs const& e) {
         double w = g.ActualWidth();
@@ -6107,7 +6139,7 @@ static FrameworkElement BuildPopupSeekRow() {
     };
     sb->elapsed = makeTime(TextAlignment::Right);
     sb->total   = makeTime(TextAlignment::Left);
-    Grid track = BuildSeekTrack(sb, 4.0, 12.0);
+    Grid track = BuildSeekTrack(sb, 4.0, 4.0, 12.0, 16.0);
     track.Margin({8, 0, 8, 0});
     Grid::SetColumn(sb->elapsed, 0);
     Grid::SetColumn(track, 1);
@@ -6120,10 +6152,26 @@ static FrameworkElement BuildPopupSeekRow() {
     g_popupSeekBar = sb;
     return row;
 }
+static FrameworkElement BuildTaskbarSeekBar() {
+    auto sb = std::make_shared<SeekBar>();
+    Grid host;
+    host.HorizontalAlignment(HorizontalAlignment::Stretch);
+    host.VerticalAlignment(VerticalAlignment::Stretch);
+    if (g_settings.playerMinHeight > 0) host.MinHeight((double)g_settings.playerMinHeight);
+    if (g_settings.playerMaxHeight > 0) host.MaxHeight((double)g_settings.playerMaxHeight);
+    Grid track = BuildSeekTrack(sb, 2.0, 4.0, 8.0, 8.0);
+    track.VerticalAlignment(VerticalAlignment::Bottom);
+    double inset = std::max({4.0, g_settings.cornerRadiusBL, g_settings.cornerRadiusBR});
+    track.Margin({inset, 0, inset, 0});
+    host.Children().Append(track);
+    sb->root = host;
+    UpdateSeekBar(*sb);
+    g_taskbarSeekBar = sb;
+    return host;
+}
 static void SeekTimerTick(winrt::Windows::Foundation::IInspectable const&,
                           winrt::Windows::Foundation::IInspectable const&) {
-    if (g_unloading) return;
-    if (g_popupSeekBar) UpdateSeekBar(*g_popupSeekBar);
+    RefreshSeekBars();
 }
 static void SetSeekTimerRunning(bool run) {
     try {
@@ -6132,10 +6180,23 @@ static void SetSeekTimerRunning(bool run) {
             g_seekTimer.Interval(winrt::Windows::Foundation::TimeSpan{std::chrono::milliseconds(250)});
             g_seekTimer.Tick(&SeekTimerTick);
         }
-        if (!g_seekTimer) return;
+        if (!g_seekTimer || g_seekTimer.IsEnabled() == run) return;
         if (run) g_seekTimer.Start();
         else     g_seekTimer.Stop();
     } catch (...) {}
+}
+// UI thread only. The timer runs while the popup is open, or while playing with the taskbar bar on.
+static void RefreshSeekBars() {
+    if (g_unloading) return;
+    bool playing = false;
+    { std::lock_guard<std::mutex> lk(g_mediaMtx); playing = g_media.isPlaying; }
+    if (g_popupSeekBar)   UpdateSeekBar(*g_popupSeekBar);
+    if (g_taskbarSeekBar) UpdateSeekBar(*g_taskbarSeekBar);
+    SetSeekTimerRunning(g_popupSeekBar || (g_taskbarSeekBar && playing));
+}
+static void RecolorSeekBars() {
+    if (g_popupSeekBar)   ApplySeekBarColors(*g_popupSeekBar);
+    if (g_taskbarSeekBar) ApplySeekBarColors(*g_taskbarSeekBar);
 }
 
 [[clang::no_destroy]] static winrt::Windows::UI::Xaml::Controls::Flyout g_miniPlayerFlyout{nullptr};
@@ -7512,7 +7573,7 @@ static void ShowMiniPlayerFlyout(FrameworkElement const& target) {
 
         Flyout flyout;
         Grid content = BuildMiniPlayerFlyoutContent();
-        if (g_popupSeekBar) SetSeekTimerRunning(true);
+        RefreshSeekBars();
 
         Grid clipHost;
         clipHost.HorizontalAlignment(HorizontalAlignment::Stretch);
@@ -7748,7 +7809,7 @@ static void ShowMiniPlayerFlyout(FrameworkElement const& target) {
             g_miniPlayerSessionListRef = nullptr;
             g_miniPlayerSessionListSepRef = nullptr;
             g_popupSeekBar = nullptr;
-            SetSeekTimerRunning(false);
+            RefreshSeekBars();
             g_miniSessionCachedThumbSizes.clear();
             if (g_playerButtonStateUpdater) g_playerButtonStateUpdater();
         });
@@ -8544,6 +8605,11 @@ static Grid BuildPlayerGrid() {
         wrapper.Children().Append(backgroundBorder);
         wrapper.Children().Append(playerButton);
         wrapper.Children().Append(panel);
+        if (g_settings.showSeekBarOnTaskbar) {
+            auto seekHost = BuildTaskbarSeekBar();
+            Canvas::SetZIndex(seekHost, 3);
+            wrapper.Children().Append(seekHost);
+        }
         ApplyFluentMediaButtonStyle(playerButton);
         if (!g_settings.showDebugBorders) {
             playerButton.BorderThickness({1, 1, 1, 1});
@@ -9374,6 +9440,7 @@ static void RemovePlayerGrid() {
         g_miniPlayerSessionListRef    = nullptr;
         g_miniPlayerSessionListSepRef = nullptr;
         g_popupSeekBar                = nullptr;
+        g_taskbarSeekBar              = nullptr;
     } catch (...) {
         g_playerGrid      = nullptr;
         g_injectionParent = nullptr;
@@ -9399,6 +9466,7 @@ static void RemovePlayerGrid() {
         g_miniPlayerSessionListRef    = nullptr;
         g_miniPlayerSessionListSepRef = nullptr;
         g_popupSeekBar                = nullptr;
+        g_taskbarSeekBar              = nullptr;
     }
 }
 static void RefreshPlayerContents() {
@@ -10098,6 +10166,7 @@ static void RefreshPlayerContents() {
                     }
                 }
             }
+            RecolorSeekBars();
         } catch (...) {}
     }
     if (g_settings.showAppIcon) {
@@ -10180,6 +10249,7 @@ static void RefreshPlayerContents() {
             }
         }
     } catch (...) {}
+    RefreshSeekBars();
     RefreshMiniPlayerFlyoutUI();
 }
 static bool IsFullscreenActive() {
@@ -10398,6 +10468,12 @@ static void WINAPI TrayUI_StartTaskbar_Hook(void* pThis) {
     StopScrollTimer();
     g_scrollDispatcherTimer = nullptr;
     g_scrollDispatcherTimerHasToken = false;
+    if (g_seekTimer) {
+        try { g_seekTimer.Stop(); } catch (...) {}
+        g_seekTimer = nullptr;
+    }
+    g_popupSeekBar   = nullptr;
+    g_taskbarSeekBar = nullptr;
     if (g_settings.vizEnabled) {
         SpawnTrackedWorker([]() {
             StopVizCaptureThread();
@@ -10516,6 +10592,7 @@ void Wh_ModUninit() {
             g_miniPlayerSessionListRef    = nullptr;
             g_miniPlayerSessionListSepRef = nullptr;
             g_popupSeekBar                = nullptr;
+            g_taskbarSeekBar              = nullptr;
             if (g_seekTimer) {
                 try { g_seekTimer.Stop(); } catch (...) {}
                 g_seekTimer = nullptr;
