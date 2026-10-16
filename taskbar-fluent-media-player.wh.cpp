@@ -368,6 +368,20 @@ If you encounter any issues or have a feature suggestion, please open a report o
       $name:ru-RU: Чувствительность (0-300)
     $name: Visualizer
     $name:ru-RU: Визуализатор
+
+  - SeekBarSettings:
+    - showSeekBarInPopup: true
+      $name: Show seek bar in player menu
+      $name:ru-RU: Показывать полосу перемотки в меню плеера
+      $description: Elapsed time, a draggable progress bar and total time in the mini player popup. Hidden for apps that don't report the track length.
+      $description:ru-RU: Прошедшее время, перетаскиваемая полоса прогресса и общая длительность в мини-плеере. Скрывается для приложений, которые не сообщают длительность трека.
+    - seekBarColor: "-1 -1 -1"
+      $name: Seek bar color (RGB)
+      $name:ru-RU: Цвет полосы перемотки (RGB)
+      $description: "Color of the played part; the rest of the bar uses the same color, faded. Use '-1 -1 -1' for the system accent color, '-2 -2 -2' for the album color. You can also specify two colors separated by a $ symbol (e.g., '0 0 0$255 255 255') where the first color is for light theme and the second for dark theme."
+      $description:ru-RU: "Цвет проигранной части; остальная часть полосы использует тот же цвет, но бледнее. Используйте '-1 -1 -1' для системного цвета акцента, '-2 -2 -2' для цвета альбома. Также можно указать два цвета через символ $ (например, '0 0 0$255 255 255'), где первый цвет для светлой темы, второй для тёмной."
+    $name: Seek Bar
+    $name:ru-RU: Полоса перемотки
   $name: Main Settings
   $name:ru-RU: Основные настройки
 
@@ -1410,6 +1424,8 @@ struct ModSettings {
     int          vizSensitivity  = 150;
     int          vizPadLeft      = 0;
     int          vizPadRight     = 0;
+    bool         showSeekBarInPopup = true;
+    std::wstring seekBarColor    = L"-1 -1 -1";
 };
 static ModSettings g_settings;
 static void ParseTwoInts(const std::wstring& s, int& a, int& b) {
@@ -1648,6 +1664,8 @@ static void LoadSettings() {
     g_settings.vizColor        = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor",  L"255 255 255");
     g_settings.vizColor1       = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor1", L"30 215 96");
     g_settings.vizColor2       = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor2", L"0 180 255");
+    g_settings.showSeekBarInPopup = Wh_GetIntSetting(L"MainSettings.SeekBarSettings.showSeekBarInPopup") != 0;
+    g_settings.seekBarColor    = Str(L"MainSettings.SeekBarSettings.seekBarColor", L"-1 -1 -1");
     g_settings.vizSensitivity  = Int(L"MainSettings.VisualizerFunctionsSettings.vizSensitivity", 0, 300, 150);
     {
         int n = 7, gap = 5;
@@ -2015,8 +2033,23 @@ struct MediaState {
     bool              canShuffle       = true;
     bool              canRepeat        = true;
     bool              canSeek          = true;
+    // Timeline in 100ns ticks. Apps only report it on play/pause/seek/track change, so the live position is extrapolated.
+    int64_t           timelineStart    = 0;
+    int64_t           timelineEnd      = 0;
+    int64_t           timelinePos      = 0;
+    winrt::clock::time_point timelineUpdated{};
+    double            playbackRate     = 1.0;
 };
 static MediaState g_media;
+static int64_t ExtrapolateTimelinePos(int64_t pos, int64_t elapsedTicks, double rate, bool playing,
+                                      int64_t start, int64_t end) {
+    if (playing && elapsedTicks > 0) pos += (int64_t)(elapsedTicks * rate);
+    return std::clamp(pos, start, std::max(start, end));
+}
+static int64_t LiveTimelinePos(MediaState const& m) {
+    return ExtrapolateTimelinePos(m.timelinePos, (winrt::clock::now() - m.timelineUpdated).count(),
+                                  m.playbackRate, m.isPlaying, m.timelineStart, m.timelineEnd);
+}
 static std::mutex g_mediaMtx;
 static std::wstring g_lastTitleArtistKey;
 static uint64_t     g_suspectArtSize   = 0;
@@ -2074,6 +2107,7 @@ static winrt::event_token g_evSessionsChanged{};
 static winrt::event_token g_evCurrentChanged{};
 static winrt::event_token g_evMediaProps{};
 static winrt::event_token g_evPlayback{};
+static winrt::event_token g_evTimeline{};
 static HANDLE g_mediaThread    = nullptr;
 static HANDLE g_mediaStopEvent = nullptr;
 static bool IsSystemLightTheme() {
@@ -3795,11 +3829,21 @@ static void FetchPlaybackInfoAsync() {
                     }
                     auto status = info.PlaybackStatus();
                     bool playing = (status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
+                    double rate = 1.0;
+                    try {
+                        auto rateRef = info.PlaybackRate();
+                        if (rateRef && rateRef.Value() > 0) rate = rateRef.Value();
+                    } catch (...) {}
                     bool wasPlaying = false;
                     {
                         std::lock_guard<std::mutex> lk(g_mediaMtx);
                         wasPlaying = g_media.isPlaying;
-                        g_media.isPlaying = playing;
+                        if (playing != wasPlaying) {
+                            g_media.timelinePos     = LiveTimelinePos(g_media);
+                            g_media.timelineUpdated = winrt::clock::now();
+                        }
+                        g_media.isPlaying    = playing;
+                        g_media.playbackRate = rate;
                     }
                     if (playing != wasPlaying) {
                         if (!playing && wasPlaying) {
@@ -3852,12 +3896,35 @@ static void FetchPlaybackInfoAsync() {
         winrt::uninit_apartment();
     });
 }
+static void FetchTimelineAsync() {
+    SpawnTrackedWorker([]() {
+        if (g_unloading) return;
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        try {
+            GlobalSystemMediaTransportControlsSession session{nullptr};
+            { std::lock_guard<std::mutex> lk(g_sessionMtx); session = g_currentSession; }
+            if (session) {
+                auto timeline = session.GetTimelineProperties();
+                auto now = winrt::clock::now();
+                auto updated = timeline.LastUpdatedTime();
+                if (updated > now || updated.time_since_epoch().count() <= 0) updated = now;
+                std::lock_guard<std::mutex> lk(g_mediaMtx);
+                g_media.timelineStart   = timeline.StartTime().count();
+                g_media.timelineEnd     = timeline.EndTime().count();
+                g_media.timelinePos     = timeline.Position().count();
+                g_media.timelineUpdated = updated;
+            }
+        } catch (...) {}
+        winrt::uninit_apartment();
+    });
+}
 static void DetachCurrentSession() {
     std::lock_guard<std::mutex> lk(g_sessionMtx);
     if (!g_currentSession) return;
     try {
         if (g_evMediaProps.value) { g_currentSession.MediaPropertiesChanged(g_evMediaProps); g_evMediaProps = {}; }
         if (g_evPlayback.value)   { g_currentSession.PlaybackInfoChanged(g_evPlayback); g_evPlayback = {}; }
+        if (g_evTimeline.value)   { g_currentSession.TimelinePropertiesChanged(g_evTimeline); g_evTimeline = {}; }
     } catch (...) {}
     g_currentSession = nullptr;
     g_repeatMode = RepeatMode::Off;
@@ -3869,6 +3936,9 @@ static void DetachCurrentSession() {
         g_media.canShuffle      = true;
         g_media.canRepeat       = true;
         g_media.canSeek         = true;
+        g_media.timelineStart   = 0;
+        g_media.timelineEnd     = 0;
+        g_media.timelinePos     = 0;
     }
 }
 static GlobalSystemMediaTransportControlsSession PickBestSession() {
@@ -4003,6 +4073,9 @@ static void AttachToSession(GlobalSystemMediaTransportControlsSession session) {
             g_evPlayback = g_currentSession.PlaybackInfoChanged([](auto const&, auto const&) {
                 if (!g_unloading) FetchPlaybackInfoAsync();
             });
+            g_evTimeline = g_currentSession.TimelinePropertiesChanged([](auto const&, auto const&) {
+                if (!g_unloading) FetchTimelineAsync();
+            });
         } catch (...) {
             Wh_Log(L"AttachToSession: Failed to attach event handlers");
             g_currentSession = nullptr;
@@ -4012,6 +4085,7 @@ static void AttachToSession(GlobalSystemMediaTransportControlsSession session) {
 fetch:
     FetchMediaPropertiesAsync();
     FetchPlaybackInfoAsync();
+    FetchTimelineAsync();
 }
 static void OnSessionsChanged() {
     if (g_unloading) return;
@@ -5861,6 +5935,209 @@ static void ShowMediaContextMenu(FrameworkElement const& target) {
     }
 }
 
+static std::wstring FormatMediaTime(int64_t ticks) {
+    int s = (int)(std::max<int64_t>(0, ticks) / 10'000'000);
+    wchar_t buf[32];
+    if (s >= 3600) swprintf(buf, 32, L"%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60);
+    else           swprintf(buf, 32, L"%d:%02d", s / 60, s % 60);
+    return buf;
+}
+struct SeekBar {
+    FrameworkElement root{nullptr};
+    Grid             track{nullptr};
+    Border           fill{nullptr};
+    winrt::Windows::UI::Xaml::Shapes::Ellipse thumb{nullptr};
+    TextBlock        elapsed{nullptr};
+    TextBlock        total{nullptr};
+    bool             hovered  = false;
+    bool             dragging = false;
+    double           dragFrac = 0.0;
+};
+[[clang::no_destroy]] static std::shared_ptr<SeekBar> g_popupSeekBar;
+[[clang::no_destroy]] static winrt::Windows::UI::Xaml::DispatcherTimer g_seekTimer{nullptr};
+static void SeekToFraction(double frac) {
+    int64_t target = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mediaMtx);
+        if (g_media.timelineEnd <= g_media.timelineStart) return;
+        target = g_media.timelineStart + (int64_t)(frac * (double)(g_media.timelineEnd - g_media.timelineStart));
+        g_media.timelinePos     = target;
+        g_media.timelineUpdated = winrt::clock::now();
+    }
+    SpawnTrackedWorker([target]() {
+        if (g_unloading) return;
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        try {
+            GlobalSystemMediaTransportControlsSession session{nullptr};
+            { std::lock_guard<std::mutex> lk(g_sessionMtx); session = g_currentSession; }
+            if (session) session.TryChangePlaybackPositionAsync(target).get();
+        } catch (...) {}
+        winrt::uninit_apartment();
+    });
+}
+static void UpdateSeekBar(SeekBar& sb) {
+    if (!sb.root) return;
+    int64_t start = 0, end = 0, pos = 0;
+    bool show = false, canSeek = false;
+    {
+        std::lock_guard<std::mutex> lk(g_mediaMtx);
+        start   = g_media.timelineStart;
+        end     = g_media.timelineEnd;
+        pos     = LiveTimelinePos(g_media);
+        show    = g_media.hasMedia && end > start;
+        canSeek = g_media.canSeek;
+    }
+    try {
+        sb.root.Visibility(show ? Visibility::Visible : Visibility::Collapsed);
+        if (!show) return;
+        double frac = sb.dragging ? sb.dragFrac : (double)(pos - start) / (double)(end - start);
+        double w = sb.track.ActualWidth();
+        sb.fill.Width(frac * w);
+        if (auto t = sb.thumb.RenderTransform().try_as<TranslateTransform>())
+            t.X(frac * w - sb.thumb.Width() / 2);
+        sb.thumb.Visibility(canSeek && (sb.hovered || sb.dragging) ? Visibility::Visible : Visibility::Collapsed);
+        sb.track.IsHitTestVisible(canSeek);
+        if (sb.elapsed) sb.elapsed.Text(winrt::hstring(FormatMediaTime((int64_t)(frac * (double)(end - start)))));
+        if (sb.total)   sb.total.Text(winrt::hstring(FormatMediaTime(end - start)));
+    } catch (...) {}
+}
+static Grid BuildSeekTrack(std::shared_ptr<SeekBar> const& sb, double lineH, double thumbD) {
+    using winrt::Windows::Foundation::IInspectable;
+    auto color = ParseColorWithThemeSupport(g_settings.seekBarColor, 255);
+    auto faded = color;
+    faded.A = 0x50;
+    Grid track;
+    track.Height(std::max(lineH, thumbD) + 4);
+    track.Background(MakeBrush({0x00, 0x00, 0x00, 0x00}));
+    Border rail;
+    rail.Height(lineH);
+    rail.CornerRadius({lineH / 2, lineH / 2, lineH / 2, lineH / 2});
+    rail.VerticalAlignment(VerticalAlignment::Center);
+    rail.Background(MakeBrush(faded));
+    Border fill;
+    fill.Height(lineH);
+    fill.Width(0);
+    fill.CornerRadius({lineH / 2, lineH / 2, lineH / 2, lineH / 2});
+    fill.HorizontalAlignment(HorizontalAlignment::Left);
+    fill.VerticalAlignment(VerticalAlignment::Center);
+    fill.Background(MakeBrush(color));
+    winrt::Windows::UI::Xaml::Shapes::Ellipse thumb;
+    thumb.Width(thumbD);
+    thumb.Height(thumbD);
+    thumb.HorizontalAlignment(HorizontalAlignment::Left);
+    thumb.VerticalAlignment(VerticalAlignment::Center);
+    thumb.Fill(MakeBrush(color));
+    thumb.RenderTransform(TranslateTransform());
+    thumb.IsHitTestVisible(false);
+    thumb.Visibility(Visibility::Collapsed);
+    track.Children().Append(rail);
+    track.Children().Append(fill);
+    track.Children().Append(thumb);
+    sb->track = track;
+    sb->fill  = fill;
+    sb->thumb = thumb;
+    std::weak_ptr<SeekBar> weak = sb;
+    auto fracAt = [](Grid const& g, PointerRoutedEventArgs const& e) {
+        double w = g.ActualWidth();
+        return w > 0 ? std::clamp((double)e.GetCurrentPoint(g).Position().X / w, 0.0, 1.0) : 0.0;
+    };
+    track.PointerEntered([weak](IInspectable const&, PointerRoutedEventArgs const&) {
+        if (auto s = weak.lock()) { s->hovered = true; UpdateSeekBar(*s); }
+    });
+    track.PointerExited([weak](IInspectable const&, PointerRoutedEventArgs const&) {
+        if (auto s = weak.lock()) { s->hovered = false; UpdateSeekBar(*s); }
+    });
+    track.PointerPressed([weak, fracAt](IInspectable const& sender, PointerRoutedEventArgs const& e) {
+        auto s = weak.lock();
+        auto g = sender.try_as<Grid>();
+        if (!s || !g || !e.GetCurrentPoint(g).Properties().IsLeftButtonPressed()) return;
+        g.CapturePointer(e.Pointer());
+        s->dragging = true;
+        s->dragFrac = fracAt(g, e);
+        UpdateSeekBar(*s);
+        e.Handled(true);
+    });
+    track.PointerMoved([weak, fracAt](IInspectable const& sender, PointerRoutedEventArgs const& e) {
+        auto s = weak.lock();
+        auto g = sender.try_as<Grid>();
+        if (!s || !g || !s->dragging) return;
+        s->dragFrac = fracAt(g, e);
+        UpdateSeekBar(*s);
+        e.Handled(true);
+    });
+    track.PointerReleased([weak, fracAt](IInspectable const& sender, PointerRoutedEventArgs const& e) {
+        auto s = weak.lock();
+        auto g = sender.try_as<Grid>();
+        if (!s || !g || !s->dragging) return;
+        s->dragFrac = fracAt(g, e);
+        s->dragging = false;
+        g.ReleasePointerCapture(e.Pointer());
+        SeekToFraction(s->dragFrac);
+        UpdateSeekBar(*s);
+        e.Handled(true);
+    });
+    track.PointerCaptureLost([weak](IInspectable const&, PointerRoutedEventArgs const&) {
+        if (auto s = weak.lock(); s && s->dragging) { s->dragging = false; UpdateSeekBar(*s); }
+    });
+    track.SizeChanged([weak](IInspectable const&, SizeChangedEventArgs const&) {
+        if (auto s = weak.lock()) UpdateSeekBar(*s);
+    });
+    return track;
+}
+static FrameworkElement BuildPopupSeekRow() {
+    auto sb = std::make_shared<SeekBar>();
+    Grid row;
+    row.Margin({0, 4, 0, 0});
+    ColumnDefinition colElapsed, colTrack, colTotal;
+    colElapsed.Width({1.0, GridUnitType::Auto});
+    colTrack.Width({1.0, GridUnitType::Star});
+    colTotal.Width({1.0, GridUnitType::Auto});
+    row.ColumnDefinitions().Append(colElapsed);
+    row.ColumnDefinitions().Append(colTrack);
+    row.ColumnDefinitions().Append(colTotal);
+    auto makeTime = [](TextAlignment align) {
+        TextBlock t;
+        t.FontSize(12);
+        t.MinWidth(36);
+        t.Opacity(0.65);
+        t.Foreground(MakeBrush(ArtistColor()));
+        t.TextAlignment(align);
+        t.VerticalAlignment(VerticalAlignment::Center);
+        return t;
+    };
+    sb->elapsed = makeTime(TextAlignment::Right);
+    sb->total   = makeTime(TextAlignment::Left);
+    Grid track = BuildSeekTrack(sb, 4.0, 12.0);
+    track.Margin({8, 0, 8, 0});
+    Grid::SetColumn(sb->elapsed, 0);
+    Grid::SetColumn(track, 1);
+    Grid::SetColumn(sb->total, 2);
+    row.Children().Append(sb->elapsed);
+    row.Children().Append(track);
+    row.Children().Append(sb->total);
+    sb->root = row;
+    UpdateSeekBar(*sb);
+    g_popupSeekBar = sb;
+    return row;
+}
+static void SeekTimerTick(winrt::Windows::Foundation::IInspectable const&,
+                          winrt::Windows::Foundation::IInspectable const&) {
+    if (g_unloading) return;
+    if (g_popupSeekBar) UpdateSeekBar(*g_popupSeekBar);
+}
+static void SetSeekTimerRunning(bool run) {
+    try {
+        if (run && !g_seekTimer) {
+            g_seekTimer = winrt::Windows::UI::Xaml::DispatcherTimer();
+            g_seekTimer.Interval(winrt::Windows::Foundation::TimeSpan{std::chrono::milliseconds(250)});
+            g_seekTimer.Tick(&SeekTimerTick);
+        }
+        if (!g_seekTimer) return;
+        if (run) g_seekTimer.Start();
+        else     g_seekTimer.Stop();
+    } catch (...) {}
+}
+
 [[clang::no_destroy]] static winrt::Windows::UI::Xaml::Controls::Flyout g_miniPlayerFlyout{nullptr};
 [[clang::no_destroy]] static Controls::Image g_miniPlayerArtRef{nullptr};
 [[clang::no_destroy]] static TextBlock       g_miniPlayerTitleRef{nullptr};
@@ -5941,6 +6218,7 @@ static void RefreshMiniPlayerFlyoutUI() {
     }
     
     try {
+        if (g_popupSeekBar) UpdateSeekBar(*g_popupSeekBar);
         if (g_miniPlayerTitleRef) {
             std::wstring displayTitle;
             if (!hasMedia) {
@@ -6727,6 +7005,10 @@ static Grid BuildMiniPlayerFlyoutContent() {
     artistBlock.Text(artist.empty() ? winrt::hstring(L" ") : winrt::hstring(artist));
     content.Children().Append(wrapDebugBorder(artistBlock, {0xFF, 0x00, 0xFF, 0x00}));
 
+    if (g_settings.showSeekBarInPopup) {
+        content.Children().Append(BuildPopupSeekRow());
+    }
+
     StackPanel controlsRow;
     controlsRow.Orientation(Orientation::Horizontal);
     controlsRow.HorizontalAlignment(HorizontalAlignment::Center);
@@ -7230,6 +7512,7 @@ static void ShowMiniPlayerFlyout(FrameworkElement const& target) {
 
         Flyout flyout;
         Grid content = BuildMiniPlayerFlyoutContent();
+        if (g_popupSeekBar) SetSeekTimerRunning(true);
 
         Grid clipHost;
         clipHost.HorizontalAlignment(HorizontalAlignment::Stretch);
@@ -7464,6 +7747,8 @@ static void ShowMiniPlayerFlyout(FrameworkElement const& target) {
             g_miniPlayerRepeatBtnRef = nullptr;
             g_miniPlayerSessionListRef = nullptr;
             g_miniPlayerSessionListSepRef = nullptr;
+            g_popupSeekBar = nullptr;
+            SetSeekTimerRunning(false);
             g_miniSessionCachedThumbSizes.clear();
             if (g_playerButtonStateUpdater) g_playerButtonStateUpdater();
         });
@@ -9088,6 +9373,7 @@ static void RemovePlayerGrid() {
         g_miniPlayerRepeatBtnRef      = nullptr;
         g_miniPlayerSessionListRef    = nullptr;
         g_miniPlayerSessionListSepRef = nullptr;
+        g_popupSeekBar                = nullptr;
     } catch (...) {
         g_playerGrid      = nullptr;
         g_injectionParent = nullptr;
@@ -9112,6 +9398,7 @@ static void RemovePlayerGrid() {
         g_miniPlayerRepeatBtnRef      = nullptr;
         g_miniPlayerSessionListRef    = nullptr;
         g_miniPlayerSessionListSepRef = nullptr;
+        g_popupSeekBar                = nullptr;
     }
 }
 static void RefreshPlayerContents() {
@@ -10228,6 +10515,11 @@ void Wh_ModUninit() {
             g_miniPlayerRepeatBtnRef      = nullptr;
             g_miniPlayerSessionListRef    = nullptr;
             g_miniPlayerSessionListSepRef = nullptr;
+            g_popupSeekBar                = nullptr;
+            if (g_seekTimer) {
+                try { g_seekTimer.Stop(); } catch (...) {}
+                g_seekTimer = nullptr;
+            }
             g_fluentMediaButtonStyle      = nullptr;
         }, nullptr);
     else {
