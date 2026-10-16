@@ -125,12 +125,12 @@ If you encounter any issues or have a feature suggestion, please open a report o
         Номер монитора, на котором будет отображаться плеер (1, 2, 3...).
         Это число может отличаться от номера монитора в параметрах
         экрана Windows.
-    - playerWidth: "0 0"
+    - playerWidth: "250 250"
       $name: Media player width (min max)
       $name:ru-RU: Ширина медиаплеера (min max)
       $description: The first number is the minimum size, and the second is the maximum. You can also set it to 0, which means no limit.
       $description:ru-RU: Первая цифра — это минимальный размер, а вторая — максимальный. Также можно указать 0 — это без лимита.
-    - playerHeight: "40 40"
+    - playerHeight: "50 50"
       $name: Media player height (min max)
       $name:ru-RU: Высота медиаплеера (min max)
     - playerMargin: "4 4"
@@ -375,12 +375,12 @@ If you encounter any issues or have a feature suggestion, please open a report o
       $name:ru-RU: Показывать полосу перемотки в меню плеера
       $description: Elapsed time, a draggable progress bar and total time in the mini player popup. Hidden for apps that don't report the track length.
       $description:ru-RU: Прошедшее время, перетаскиваемая полоса прогресса и общая длительность в мини-плеере. Скрывается для приложений, которые не сообщают длительность трека.
-    - showSeekBarOnTaskbar: false
+    - showSeekBarOnTaskbar: true
       $name: Show seek bar on taskbar player
       $name:ru-RU: Показывать полосу перемотки на плеере в панели задач
       $description: A thin progress line along the bottom of the player. It thickens on hover; click or drag it to seek.
       $description:ru-RU: Тонкая линия прогресса вдоль нижнего края плеера. Утолщается при наведении; нажмите или перетащите для перемотки.
-    - seekBarColor: "-1 -1 -1"
+    - seekBarColor: "203 93 232"
       $name: Seek bar color (RGB)
       $name:ru-RU: Цвет полосы перемотки (RGB)
       $description: "Color of the played part; the rest of the bar uses the same color, faded. Use '-1 -1 -1' for the system accent color, '-2 -2 -2' for the album color. You can also specify two colors separated by a $ symbol (e.g., '0 0 0$255 255 255') where the first color is for light theme and the second for dark theme."
@@ -859,7 +859,7 @@ If you encounter any issues or have a feature suggestion, please open a report o
   $name:ru-RU: Настройки внешнего вида
 
 - PlayerMenuSettings:
-  - placementMode: screen
+  - placementMode: near
     $name: Placement mode
     $name:ru-RU: Режим расположения
     $description: Choose whether the player menu (mini player popup) opens directly Near the media player, or at a fixed position on the screen.
@@ -943,7 +943,7 @@ If you encounter any issues or have a feature suggestion, please open a report o
   - keepMiniPlayerOpen: false
     $name: Keep mini player menu open
     $name:ru-RU: Не закрывать мини-плеер при клике вне
-  - hideMediaSessionsList: false
+  - hideMediaSessionsList: true
     $name: Hide media sessions list
     $name:ru-RU: Выключить список медиа сессий
     $description: Hide the list of other media sessions/apps in the player menu
@@ -1225,6 +1225,7 @@ If you encounter any issues or have a feature suggestion, please open a report o
 #include <robuffer.h>
 #include <shcore.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
@@ -1285,10 +1286,10 @@ struct ModSettings {
     bool         fullHeightHitArea    = true;
     bool         autoSwitchSession    = true;
     bool         showMediaButtons     = true;
-    int          playerMinWidth       = 0;
-    int          playerMaxWidth       = 0;
-    int          playerMinHeight      = 40;
-    int          playerMaxHeight      = 40;
+    int          playerMinWidth       = 250;
+    int          playerMaxWidth       = 250;
+    int          playerMinHeight      = 50;
+    int          playerMaxHeight      = 50;
     bool         showAlbumArt         = true;
     std::wstring albumArtEmptyBehavior = L"show";
     std::wstring emptyIconGlyph       = L"E189";
@@ -1392,8 +1393,8 @@ struct ModSettings {
     bool         showDebugBorders     = false;
     bool         showMiniPlayerBorder = false;
     bool         keepMiniPlayerOpen   = false;
-    bool         hideMediaSessionsList = false;
-    std::wstring miniPlayerPlacementMode = L"screen";
+    bool         hideMediaSessionsList = true;
+    std::wstring miniPlayerPlacementMode = L"near";
     int          miniPlayerHorizontalOffsetAbove = 0;
     std::wstring miniPlayerVerticalPlacementNear = L"top";
     std::wstring miniPlayerHorizontalPlacement = L"right";
@@ -1430,8 +1431,8 @@ struct ModSettings {
     int          vizPadLeft      = 0;
     int          vizPadRight     = 0;
     bool         showSeekBarInPopup = true;
-    bool         showSeekBarOnTaskbar = false;
-    std::wstring seekBarColor    = L"-1 -1 -1";
+    bool         showSeekBarOnTaskbar = true;
+    std::wstring seekBarColor    = L"203 93 232";
 };
 static ModSettings g_settings;
 static void ParseTwoInts(const std::wstring& s, int& a, int& b) {
@@ -1580,8 +1581,8 @@ static void LoadSettings() {
     g_settings.monitor               = std::max(1, Wh_GetIntSetting(L"MainSettings.PlayerSetting.monitor"));
     g_settings.position             = Str(L"MainSettings.PlayerSetting.position",    L"tray_left");
     ParseMargin(L"MainSettings.PlayerSetting.playerMargin", L"4 4", g_settings.playerMarginLeft, g_settings.playerMarginRight);
-    ParseMargin(L"MainSettings.PlayerSetting.playerWidth", L"0 0", g_settings.playerMinWidth, g_settings.playerMaxWidth);
-    ParseMargin(L"MainSettings.PlayerSetting.playerHeight", L"40 40", g_settings.playerMinHeight, g_settings.playerMaxHeight);
+    ParseMargin(L"MainSettings.PlayerSetting.playerWidth", L"250 250", g_settings.playerMinWidth, g_settings.playerMaxWidth);
+    ParseMargin(L"MainSettings.PlayerSetting.playerHeight", L"50 50", g_settings.playerMinHeight, g_settings.playerMaxHeight);
     ParseMargin(L"MainSettings.AlbumArtSetting.albumArtWidth", L"32 64", g_settings.albumArtMinWidth, g_settings.albumArtMaxWidth);
     ParseMargin(L"MainSettings.AlbumArtSetting.albumArtHeight", L"32 32", g_settings.albumArtMinHeight, g_settings.albumArtMaxHeight);
     ParseMargin(L"MainSettings.AlbumArtSetting.albumArtMargin", L"0 0", g_settings.albumArtLeftMargin, g_settings.albumArtRightMargin);
@@ -1672,7 +1673,7 @@ static void LoadSettings() {
     g_settings.vizColor2       = Str(L"AppearanceSettings.VisualizerStyleSettings.vizColor2", L"0 180 255");
     g_settings.showSeekBarInPopup = Wh_GetIntSetting(L"MainSettings.SeekBarSettings.showSeekBarInPopup") != 0;
     g_settings.showSeekBarOnTaskbar = Wh_GetIntSetting(L"MainSettings.SeekBarSettings.showSeekBarOnTaskbar") != 0;
-    g_settings.seekBarColor    = Str(L"MainSettings.SeekBarSettings.seekBarColor", L"-1 -1 -1");
+    g_settings.seekBarColor    = Str(L"MainSettings.SeekBarSettings.seekBarColor", L"203 93 232");
     g_settings.vizSensitivity  = Int(L"MainSettings.VisualizerFunctionsSettings.vizSensitivity", 0, 300, 150);
     {
         int n = 7, gap = 5;
@@ -1810,7 +1811,7 @@ static void LoadSettings() {
     g_settings.showLayoutAnchors    = Wh_GetIntSetting(L"DebugSettings.showLayoutAnchors") != 0;
     g_settings.keepMiniPlayerOpen   = Wh_GetIntSetting(L"PlayerMenuSettings.keepMiniPlayerOpen") != 0;
     g_settings.hideMediaSessionsList = Wh_GetIntSetting(L"PlayerMenuSettings.hideMediaSessionsList") != 0;
-    g_settings.miniPlayerPlacementMode = Str(L"PlayerMenuSettings.placementMode", L"screen");
+    g_settings.miniPlayerPlacementMode = Str(L"PlayerMenuSettings.placementMode", L"near");
     g_settings.miniPlayerHorizontalOffsetAbove =
         Wh_GetIntSetting(L"PlayerMenuSettings.PlayerMenuSettingsNear.miniPlayerHorizontalOffsetNear");
     g_settings.miniPlayerVerticalPlacementNear =
@@ -3162,6 +3163,30 @@ static std::wstring ToLowerCopy(std::wstring value);
 static std::wstring GetWindowAppUserModelId(HWND hWnd);
 static void ShowMediaContextMenu(FrameworkElement const& target);
 static void ShowMiniPlayerFlyout(FrameworkElement const& target);
+// Win32 media apps report their exe name as the AUMID (e.g. "Spotify.exe"), which shell:AppsFolder can't open.
+// Returns the full path of the running process with that exe name, or empty if none.
+static std::wstring FindRunningExePath(const std::wstring& appUserModelId) {
+    std::wstring exeName = ToLowerCopy(appUserModelId);
+    auto slash = exeName.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) exeName = exeName.substr(slash + 1);
+    if (exeName.size() < 5 || exeName.compare(exeName.size() - 4, 4, L".exe") != 0) return L"";
+    std::wstring result;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return L"";
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && result.empty(); ok = Process32NextW(snap, &pe)) {
+        if (ToLowerCopy(pe.szExeFile) != exeName) continue;
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        if (!hProc) continue;
+        wchar_t path[MAX_PATH]{};
+        DWORD sz = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, path, &sz)) result = path;
+        CloseHandle(hProc);
+    }
+    CloseHandle(snap);
+    return result;
+}
 [[maybe_unused]]
 static void ExecuteMediaAction(const std::wstring& action, FrameworkElement const& sourceElement = nullptr) {
     if (action == L"none") {
@@ -3330,8 +3355,15 @@ static void ExecuteMediaAction(const std::wstring& action, FrameworkElement cons
                 return;
             }
             if (!appAumid.empty()) {
-                std::wstring shellPath = L"shell:AppsFolder\\" + appAumid;
-                ShellExecuteW(nullptr, L"open", shellPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                // No visible window (e.g. closed to tray). Relaunching the running exe lets the app's
+                // single-instance logic show its own window, like clicking its pinned taskbar icon.
+                std::wstring exePath = FindRunningExePath(appAumid);
+                if (!exePath.empty()) {
+                    ShellExecuteW(nullptr, L"open", exePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                } else {
+                    std::wstring shellPath = L"shell:AppsFolder\\" + appAumid;
+                    ShellExecuteW(nullptr, L"open", shellPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                }
             }
         });
     }
