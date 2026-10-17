@@ -8874,7 +8874,7 @@ struct InjectionTarget {
     Grid grid;
     int  insertCol = 0;
 };
-static int RemovePlayerGridChildren(Grid const& targetGrid) {
+static int RemovePlayerGridChildren(Panel const& targetGrid) {
     if (!targetGrid) return -1;
     int firstCol = -1;
     for (int i = (int)targetGrid.Children().Size() - 1; i >= 0; --i) {
@@ -9167,6 +9167,42 @@ static InjectionTarget ResolveInjectionTarget(
     }
     return {};
 }
+// Newer builds (26H2 / late 25H2) made SystemTrayFrameGrid a StackPanel, so tray positions become child indexes, not columns.
+static std::pair<StackPanel, int> ResolveTrayStackSlot(FrameworkElement const& root, std::wstring_view position) {
+    auto trayFrame = FindChildByName(root, L"SystemTrayFrameGrid");
+    auto stack = trayFrame ? trayFrame.try_as<StackPanel>() : nullptr;
+    if (!stack) return {nullptr, -1};
+    int size = (int)stack.Children().Size();
+    if (position == L"tray_left")  return {stack, 0};
+    if (position == L"tray_right") return {stack, size};
+    static const struct { const wchar_t* position; const wchar_t* anchor; bool after; } kSlots[] = {
+        {L"tray_before_clock",            L"NotificationCenterButton", false},
+        {L"tray_after_clock",             L"ShowDesktopStack",         false},
+        {L"tray_before_omni_left",        L"ControlCenterButton",      false},
+        {L"tray_before_omni_right",       L"ControlCenterButton",      true},
+        {L"tray_language_left",           L"NonActivatableStack",      false},
+        {L"tray_language_right",          L"NonActivatableStack",      true},
+        {L"tray_hidden_icons_left",       L"NotifyIconStack",          false},
+        {L"tray_hidden_icons_right",      L"NotifyIconStack",          true},
+        {L"tray_icons_left",              L"NotificationAreaIcons",    false},
+        {L"tray_icons_right",             L"NotificationAreaIcons",    true},
+        {L"tray_after_showdesktop_left",  L"ShowDesktopStack",         false},
+        {L"tray_after_showdesktop_right", L"ShowDesktopStack",         true},
+    };
+    for (auto const& slot : kSlots) {
+        if (position != slot.position) continue;
+        // Walk up from the anchor to the tray's direct child, as Grid::GetColumn does for the Grid layout.
+        for (DependencyObject cur = FindTrayElement(stack, root, slot.anchor); cur; cur = VisualTreeHelper::GetParent(cur)) {
+            uint32_t idx = 0;
+            auto elem = cur.try_as<UIElement>();
+            if (elem && stack.Children().IndexOf(elem, idx))
+                return {stack, (int)idx + (slot.after ? 1 : 0)};
+        }
+        if (position == L"tray_after_showdesktop_right") return {stack, size};
+        break;
+    }
+    return {nullptr, -1};
+}
 static bool InjectPlayerGrid() {
     HWND hWnd = g_taskbarWnd ? g_taskbarWnd : FindCurrentProcessTaskbarWnd();
     if (!hWnd) {
@@ -9196,7 +9232,9 @@ static bool InjectPlayerGrid() {
             }
         }
         auto [targetGrid, insertCol] = ResolveInjectionTarget(root, g_settings.position);
-        if (!targetGrid) {
+        auto [trayStack, stackIndex] = ResolveTrayStackSlot(root, g_settings.position);
+        if (!targetGrid && !trayStack) {
+            Wh_Log(L"InjectPlayerGrid: no injection target for position '%ls'", g_settings.position.c_str());
             if (g_settings.enableTreeDump) {
                 DumpXamlTree(root, 0, 8);
             }
@@ -9206,10 +9244,17 @@ static bool InjectPlayerGrid() {
         if (!playerGrid) return false;
         bool startButtonModActive = IsStartButtonModActive(root);
         (void)startButtonModActive;
-        bool isTrayGrid = (targetGrid.Name() == L"SystemTrayFrameGrid");
+        bool isTrayGrid = targetGrid && (targetGrid.Name() == L"SystemTrayFrameGrid");
         RemovePlayerGridChildren(targetGrid);
         RemoveAnchorDebugOverlays(targetGrid);
-        if (isTrayGrid) {
+        if (trayStack) {
+            RemovePlayerGridChildren(trayStack);
+            playerGrid.Margin({(double)g_settings.playerMarginLeft, 0,
+                            (double)g_settings.playerMarginRight, 0});
+            trayStack.Children().InsertAt(std::min(stackIndex, (int)trayStack.Children().Size()), playerGrid);
+            g_playerColumn = -1;
+        }
+        else if (isTrayGrid) {
             ColumnDefinition newCol;
             newCol.Width({1.0, GridUnitType::Auto});
             if (insertCol >= (int)targetGrid.ColumnDefinitions().Size()) {
@@ -9406,7 +9451,8 @@ static bool InjectPlayerGrid() {
             }
         }
         g_playerGrid      = playerGrid;
-        g_injectionParent = targetGrid;
+        if (trayStack) g_injectionParent = trayStack;
+        else           g_injectionParent = targetGrid;
         RefreshPlayerContents();
         g_playerGrid.Visibility(Visibility::Visible);
         g_playerGrid.UpdateLayout();
@@ -9473,7 +9519,7 @@ static void RemovePlayerGrid() {
         auto targetGrid = g_injectionParent.try_as<Grid>();
         int playerCol = -1;
         RemoveAnchorDebugOverlays(targetGrid);
-        playerCol = RemovePlayerGridChildren(targetGrid);
+        playerCol = RemovePlayerGridChildren(g_injectionParent.try_as<Panel>());
         bool isTrackingPosition = (g_settings.position == L"taskbar_left_edge" ||
                                 g_settings.position == L"taskbar_center_edge" ||
                                 g_settings.position == L"taskbar_right_edge" ||
@@ -9485,7 +9531,7 @@ static void RemovePlayerGrid() {
                                 g_settings.position == L"taskbar_after_taskview_right" ||
                                 g_settings.position == L"taskbar_after_widgets_left" ||
                                 g_settings.position == L"taskbar_after_widgets_right");
-        if (!isTrackingPosition && playerCol >= 0 && playerCol < (int)targetGrid.ColumnDefinitions().Size()) {
+        if (targetGrid && !isTrackingPosition && playerCol >= 0 && playerCol < (int)targetGrid.ColumnDefinitions().Size()) {
             for (uint32_t i = 0; i < targetGrid.Children().Size(); ++i) {
                 auto child = targetGrid.Children().GetAt(i).try_as<FrameworkElement>();
                 if (child) {
